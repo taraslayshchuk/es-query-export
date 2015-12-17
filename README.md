@@ -1,24 +1,29 @@
-stash-query
+es-query-export
 ===========
 
-A CLI Tool for Querying Logstash/Elasticsearch and Exporting the results. Uses the Lucene query syntax that Kibana utilizes, but provides the option for exporting. 
+A CLI Tool for Querying Elasticsearch and Exporting the results in CSV format. Uses the Lucene query syntax that Kibana utilizes. 
 
 Usage:
 ```
-    -c, --connect_host [HOST]        Elasticsearch host to run query on (defaults to: localhost)
-    -p, --port [PORT]                Elasticsearch port (defaults to: 9200)
-    -i, --index-prefix [PREFIX]      Index name prefix. Defaults to 'logstash-'
-    -w, --write [FILE]               Write output file location (defaults to nil)
-    -d, --debug                      Debug mode
-    -s, --start [DATE]               Start date. Format: YYYY-MM-DDThh:mm:ss.SSSZ. Ex: 2013-12-01T12:00:00.000Z
-    -e, --end [DATE]                 End date. Format: YYYY-MM-DDThh:mm:ss.SSSZ
+
+    -u, --url [URL]                  URL to Elasticsearch host to run query on (default: http://localhost:9200)
+    -i, --index-prefix [PREFIX]      Index name prefix(es). Defaults to 'logstash-*'. Comma delimited
     -q, --query [QUERY]              Query string
     -t, --tags [TAGS]                Tags to query. Comma delimited
-    -f, --write-fields [FIELDS]      Comma delimited list of Logstash fields to write to output file. Defaults to "message"
-    -l, --delimiter [DELIMITER]      Delimiter to use in output file. Defaults to ","
+    -w, --write [FILE]               Write output file location
+    -f, --fields [FIELDS]            Comma delimited list of docs fields in output. Defaults to "_all" fields
+    -l, --delimiter [DELIMITER]      Delimiter to use in output. Defaults to ","
+    -d, --debug                      Debug mode
+    -s, --silent                     Run silently
+    -m, --max [INTEGER]              Maximum number of results to return. Non-integer arguments default to 0.
+
 ```
 
 Examples:
 ```
-stash-query -s 2013-12-01T00:00:00.000Z -e 2013-12-02T00:00:00.000Z -t my_tag -q 'message:hello_world' -w /tmp/my_query.txt
+es-query-export -u http://kibana.com:80/es -i logstash-2015.10.* -q host:localhost and host:127.0.0.1 -f message,date,host -w output.csv -l ';'
+es-query-export -u kibana.com:80/es -i logstash-2015.10.11,logstash-2015.10.03,logstash-2015.10.25 -q host:localhost -f _all
+es-query-export -u http://localhost:9200 -i _all -q cluster:c2 -t prod,dev
+es-query-export -u localhost:9200 -i _all -q *:* -f _all -w output.csv
+es-query-export -q *:*
 ```

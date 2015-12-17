@@ -1,0 +1,288 @@
+#!/usr/bin/env ruby
+
+require 'rubygems' if RUBY_VERSION < '1.9.0'
+require 'elasticsearch'
+require 'json'
+require 'date'
+require 'optparse'
+require 'curb'
+require 'progress_bar'
+
+class Query
+
+  $flush_buffer = 1000 ## Number of docs to flush in file
+  $connection_timeout = 120
+  $retry_sleep_time = 120
+  $retry_max_count = 3
+
+  attr_reader :query_finished
+  attr_reader :num_results
+
+  def initialize(conf = {})
+
+    @config = conf
+
+    @config[:scroll_size] = '100'
+    @config[:scroll_time] = '30m'
+    @num_results = 0
+    @query_finished = false
+    @scroll_ids = Array.new
+    unless @config[:silent]
+      require 'progress_bar'
+    end
+    # Cleanup output file.
+    begin
+      File.truncate(@config[:output], 0)
+    rescue
+      # ignored
+    end unless @config[:output].nil?
+    @es_conn = connect_to_es
+    run_query
+    sort_file
+  end
+
+  private
+
+  def sort_file
+    ## Sort output in file.
+    unless @config[:output].nil?
+      arr = File.readlines(@config[:output]).sort
+      File.open(@config[:output], 'w') do |f|
+        f.puts arr
+      end
+    end
+  end
+
+  def flush_to_file(hit_list)
+    ## Write part of query docs in output file.
+    hit_list = hit_list.split('\n') if hit_list.is_a? String
+    File.open(@config[:output], 'a') do |file|
+      begin
+        file.puts(generate_output(hit_list))
+      rescue
+        puts 'Error writing to file.'
+        exit
+      end
+    end
+  end
+
+  def generate_output(hit_list)
+    ## Format docs by selected fields from query
+    output_data = []
+    hit_list.each do |event|
+      event_data = []
+      if @config[:fields].include?('_all')
+        event['_source'].keys.each do |field|
+          event_data << "#{event['_source'][field]}".gsub('\n', '')
+        end
+      else
+        @config[:fields].each do |field|
+          event_data << "#{event['_source'][field] if event['_source'][field]}".gsub('\n', '')
+        end
+      end
+      output_data << event_data.join(@config[:delimiter])
+    end
+    output_data
+  end
+
+  def connect_to_es
+    ## Create connection to Elasticsearch server
+    retry_count = 0
+    begin
+      es = Elasticsearch::Client.new(:url => @config[:url],:timeout=> $connection_timeout)
+      es.cluster.health
+    rescue
+      retry_count += 1
+      puts "Could not connect to Elasticsearch cluster: #{@config[:url]}"
+      exit if retry_count == $retry_max_count
+      sleep($retry_sleep_time)
+      retry
+    end
+    es
+  end
+
+  def run_query
+    ## Main method to query server.
+    queries = Array.new
+    indexes = @config[:index_prefixes]
+    queries << @config[:query]
+    queries << @config[:tags] if @config[:tags]
+    query = queries.join(' AND ')
+
+    # Make sure each index exists
+    good_indexes = Array.new
+
+    if indexes.include?('_all')
+      indexes = ['_all']
+    else
+      indexes.each do |index|
+        good_indexes << index if @es_conn.indices.exists index: index
+      end
+      indexes = good_indexes
+      if indexes.empty?
+        puts "Any of indexes (#{@config[:index_prefixes].join(', ')}) does not exist in #{@config[:url]}"
+        exit
+      end
+    end
+
+    puts "Using these indices: #{indexes.join(', ')}" if @config[:debug]
+    puts "Query: #{query}" if @config[:debug]
+    puts "Output fields: #{@config[:fields].join(', ')}" if @config[:debug]
+
+    # Run search query.
+    retry_count = 0
+    begin
+      res = @es_conn.search index: indexes.join(','), q: query, search_type: 'scan', scroll: @config[:scroll_time], size: @config[:scroll_size], df: 'message'
+    rescue
+      retry_count += 1
+      puts 'Looks like Elasticsearch server is down'
+      exit if retry_count == $retry_max_count
+      sleep($retry_sleep_time)
+      retry
+    end
+    scroll_id = res['_scroll_id']
+    @scroll_ids << res['_scroll_id']
+    @num_results = res['hits']['total']
+
+    puts "Found #{@num_results} results" if !@config[:silent] or @config[:debug]
+    puts res.inspect if @config[:debug]
+
+    if @num_results > 0
+      bar = ProgressBar.new(@num_results) unless @config[:silent]
+      hit_list = Array.new
+      total_lines = 0 if @config[:debug]
+      while true
+        # Scroll through data
+        begin
+          res = @es_conn.scroll scroll: @config[:scroll_time], body: scroll_id
+          scroll_id = res['_scroll_id']
+          @scroll_ids << res['_scroll_id']
+        rescue
+          puts 'Connection refused.'
+          exit
+        end
+        begin
+          break if res['hits']['hits'].length < 1
+        rescue => e
+          raise e
+        end
+        res['hits']['hits'].each do |hit|
+          bar.increment! unless @config[:silent]
+          hit_list << hit
+          if @config[:max_results]
+            # Set break flag
+            if hit_list.length == @config[:max_results]
+              puts "Hit max result limit: #{@config[:max_results]} records" if @config[:debug]
+              $break_while_loop = true
+              break
+            end
+          end
+          if hit_list.length % $flush_buffer == 0
+            @config[:output] ? flush_to_file(hit_list) : (puts generate_output(hit_list))
+            hit_list = Array.new
+          end
+        end
+        total_lines += res['hits']['hits'].length if @config[:debug]
+        # Break if break flag set
+        break if $break_while_loop
+
+      end
+      @config[:output] ? flush_to_file(hit_list) : (puts generate_output(hit_list))
+    end
+    @query_finished = true
+    clean_scroll_ids
+  end
+
+  def clean_scroll_ids
+    ## Delete the scroll_ids to free up resources on the ES cluster
+    @scroll_ids.uniq.each do |scroll|
+      puts "DELETE SCROLL:#{scroll}" if @config[:debug]
+      begin
+        Curl.delete("#{@config[:url]}/_search/scroll/#{scroll}")
+      rescue
+        puts 'Delete failed' if @config[:debug]
+      end
+    end
+  end
+end
+
+
+def cmd_line
+  $config = {}
+
+  # arguments by default
+  $config[:silent] = false
+  $config[:debug] = false
+  $config[:index_prefixes] = ['logstash-*']
+  $config[:url] = 'http://localhost:9200'
+  $config[:delimiter] = ','
+  $config[:fields] = ['_all']
+  $config[:max_results] = 0
+
+  OptionParser.new do |opts|
+    opts.banner = "Usage:
+    #{__FILE__} -u http://kibana.com:80/es -i logstash-2015.10.* -q host:localhost and host:127.0.0.1 -f message,date,host -w output.csv -l ';'
+    #{__FILE__} -u kibana.com:80/es -i logstash-2015.10.11,logstash-2015.10.03,logstash-2015.10.25 -q host:localhost -f _all
+    #{__FILE__} -u http://localhost:9200 -i _all -q cluster:c2 -t prod,dev
+    #{__FILE__} -u localhost:9200 -i _all -q *:* -f _all -w output.csv
+    #{__FILE__} -q *:*
+    "
+    opts.on('-u','--url [URL]', 'URL to Elasticsearch host to run query on (default: http://localhost:9200)') do |v|
+      $config[:url] = v unless v.nil?
+    end
+    opts.on('-i','--index-prefix [PREFIX]', "Index name prefix(es). Defaults to 'logstash-*'. Comma delimited") do |prefix|
+      $config[:index_prefixes] = prefix.split(',') unless prefix.nil?
+    end
+    opts.on('-q', '--query [QUERY]', 'Query string') do |v|
+      $config[:query] = v unless v.nil?
+    end
+    opts.on('-t', '--tags [TAGS]', 'Tags to query. Comma delimited')  do |tags|
+      unless tags.nil?
+        arr = tags.split(',')
+        if arr.length > 1
+          $config[:tags] = 'tags:(' + arr.join(' AND ') + ')'
+        else
+          $config[:tags] = "tags:#{tags}"
+        end
+      end
+    end
+    opts.on('-w', '--write [FILE]', 'Write output file location') do |v|
+      $config[:output] = v unless v.nil?
+    end
+    opts.on('-f', '--fields [FIELDS]', 'Comma delimited list of docs fields in output. Defaults to "_all" fields') do |fields|
+      $config[:fields] = fields.split(',') unless fields.nil?
+    end
+    opts.on('-l', '--delimiter [DELIMITER]', 'Delimiter to use in output. Defaults to ","') do |v|
+      $config[:delimiter] = v unless v.nil?
+    end
+    opts.on('-d', '--debug', 'Debug mode') do |v|
+      $config[:debug] = true
+    end
+    opts.on('-s', '--silent', 'Run silently') do |v|
+      $config[:silent] = true
+    end
+    opts.on('-m', '--max [INTEGER]', OptionParser::DecimalInteger, 'Maximum number of results to return. Non-integer arguments default to 0.') do |v|
+      $config[:max_results] = v unless v.nil?
+    end
+
+    opts.parse!
+    # check what all needed arguments exist
+    missing = [:query].select{ |param| $config[param].nil? }
+    unless missing.empty?
+      puts "Missing options: #{missing.join(', ')}"
+      puts opts
+      exit
+    end
+  end
+  $config
+end
+
+
+if __FILE__ == $0
+  config = cmd_line
+  es = Query.new(config)
+  exit if es.num_results < 1
+  until es.query_finished do
+    sleep 2
+  end
+end
