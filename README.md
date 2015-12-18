@@ -33,5 +33,6 @@ es-query-export -u http://localhost:9200 -i _all -q cluster:c2 -t prod,dev
 es-query-export -u localhost:9200 -i _all -q *:* -f _all -w output.csv
 es-query-export -i _all -q *:* -f status,host -w output.csv
 es-query-export -i _all -q *:* -f _all -w output.csv -s
+es-query-export -u http://user:password@kibana.com:80/es -i _all -q *:* -f _all
 es-query-export -q *:*
 ```
